@@ -84,14 +84,23 @@ cloudinary.config(
 )
 
 # Twilio
-ACCOUNT_SID = "AC77887f9c53cbc897caaa895720a3d88e"
-AUTH_TOKEN = "5cdf7097f3879db06e14bf06441b3a1d"
+# ACCOUNT_SID = "AC77887f9c53cbc897caaa895720a3d88e"
+# ACCOUNT_SID = "ACa26fd4ddf397d09867a3c7fc6c812b06"
+# ACCOUNT_SID = "AC6bf5e6aa371f2d6cd0ac0945c44973bb"
+ACCOUNT_SID = "***"
+
+
+
+# AUTH_TOKEN = "5cdf7097f3879db06e14bf06441b3a1d"
+# AUTH_TOKEN = "cddc3f97b5c10286942da0b3fa22dd09"
+# AUTH_TOKEN = "6954ccdfc3120e1d885dcbe5fd965dcf"
+AUTH_TOKEN = "***"
+
+
 
 twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
 TWILIO_WHATSAPP = "whatsapp:+14155238886"  # Sandbox
-# TO_WHATSAPP = "whatsapp:+918953193403"
-
 
 def upload_frame_to_cloudinary(frame):
 
@@ -124,7 +133,7 @@ def send_whatsapp_alert(image_url, cam_id):
     time.sleep(2)
     caregivers = [
         "whatsapp:+918953193403",
-        "whatsapp:+918618126364",
+        "whatsapp:+916382659267",
     ]
 
     try:
@@ -147,30 +156,57 @@ def send_whatsapp_alert(image_url, cam_id):
         print("Twilio failed:", e)
 
 
-def trigger_fall_alert(cam_index, frame):
+def trigger_fall_alert(cam_index):
 
     def worker():
 
         try:
-            print(f"[ALERT] Processing fall alert CAM {cam_index+1}")
+            print(f"[ALERT] Fall detected CAM {cam_index+1}")
 
-            # 1. Upload image
-            image_url = upload_frame_to_cloudinary(frame.copy())
+            # Wait 2 seconds first
+            time.sleep(1.5)
 
-            # 2. MQTT
-            send_mqtt_alert(cam_index, "FALL_DETECTED", frame)
+            # Get latest frame AFTER 2 sec
+            with frame_locks[cam_index]:
+                latest_frame = (
+                    camera_frames[cam_index].copy()
+                    if camera_frames[cam_index] is not None
+                    else None
+                )
 
-            # 3. Alarm
-            threading.Thread(target=ring_alarm, daemon=True).start()
+            if latest_frame is None:
+                print("No frame available")
+                return
 
-            # 4. WhatsApp
-            send_whatsapp_alert(image_url, cam_index)
+            # Upload image
+            image_url = upload_frame_to_cloudinary(
+                latest_frame
+            )
+
+            threading.Thread(
+                target=send_mqtt_alert,
+                args=(cam_index, "FALL_DETECTED", latest_frame),
+                daemon=True
+            ).start()
+
+            threading.Thread(
+                target=ring_alarm,
+                daemon=True
+            ).start()
+
+            threading.Thread(
+                target=send_whatsapp_alert,
+                args=(image_url, cam_index),
+                daemon=True
+            ).start()
 
         except Exception as e:
             print("[ALERT ERROR]", e)
 
-    threading.Thread(target=worker, daemon=True).start()
-
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 def camera_worker(cam_index):
@@ -261,7 +297,7 @@ last_movement_time = time.time()
 wellness_active = False
 wellness_attempts = 0
 wellness_reference_time = 0
-last_prompt_time = 0
+last_prompt_time = time.time()
 last_activity_display = datetime.now().strftime("%H:%M:%S")
 last_wellness_check_time = time.time()
 
@@ -289,7 +325,7 @@ def get_timeout():
     if hour >= 22 or hour < 6:
         return 30 * 60
 
-    return 10 * 60
+    return 1 * 60
 
 
 # ==========================
@@ -551,7 +587,7 @@ for _ in RTSP_URLS:
 
     camera_states.append({
 
-        "prev_nose_y": None,
+        "prev_hip_y": None,
 
         "rapid_drop": False,
 
@@ -560,6 +596,8 @@ for _ in RTSP_URLS:
         "fall_detected": False,
 
         "posture_history": deque(maxlen=10),
+
+        "hip_history": deque(maxlen=5),
 
         "sit_triggered": False,
 
@@ -576,6 +614,7 @@ for _ in RTSP_URLS:
         "last_visible": "Never",
 
         "last_visible_timestamp": 0,
+        "last_movement_timestamp": time.time(),
 
         "last_visible_time": time.time(),
 
@@ -585,6 +624,8 @@ for _ in RTSP_URLS:
 
         "fall_buffer": deque(maxlen=5),
         "fall_score": 0,
+        "person_detected": False,
+        "last_person_seen": 0,
 
     })
 
@@ -683,6 +724,14 @@ def start_wellness_check():
         for state in camera_states
     )
 
+    any_person_present = any(
+        state["person_detected"]
+        for state in camera_states
+    )
+
+    if not any_person_present:
+        return
+    
     wellness_active = True
     wellness_attempts = 0
     last_prompt_time = 0
@@ -702,13 +751,13 @@ def process_wellness_check():
     if not wellness_active:
         return
 
-    latest_visible = max(
-        state["last_visible_timestamp"]
+    latest_movement = max(
+        state["last_movement_timestamp"]
         for state in camera_states
     )
 
     # Person became visible again
-    if latest_visible > wellness_reference_time:
+    if latest_movement > wellness_reference_time:
 
         print(
             "[CHECK] Person visible again. Wellness cancelled."
@@ -721,11 +770,11 @@ def process_wellness_check():
 
     now = time.time()
 
-    # Prompt every 15 sec
+    # Prompt every 20 sec
     if (
-        wellness_attempts < 3
+        wellness_attempts < 2
         and
-        now - last_prompt_time > 20
+        now - last_prompt_time > 60
     ):
 
         print(
@@ -742,9 +791,9 @@ def process_wellness_check():
 
     # After 3 prompts and still no visibility
     if (
-        wellness_attempts >= 3
+        wellness_attempts >= 2
         and
-        now - last_prompt_time > 20
+        now - last_prompt_time > 60
     ):
 
         print("[CHECK] NO RESPONSE")
@@ -765,7 +814,7 @@ def process_wellness_check():
         )
 
         cv2.putText(
-            blank,
+            blank,  
             "NO RESPONSE",
             (120,180),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -774,10 +823,11 @@ def process_wellness_check():
             3
         )
 
-        
+        image_url = upload_frame_to_cloudinary(blank)
+
         threading.Thread(
             target=send_whatsapp_alert,
-            args=(image_url, cam_index),
+            args=(image_url, -1),
             daemon=True
         ).start()
 
@@ -864,12 +914,24 @@ while True:
 
             state["prev_keypoints"] = keypoints.copy()
 
-        if movement_detected:
+        if movement_detected and state["person_detected"]:
 
             last_movement_time = time.time()
 
+            state["last_movement_timestamp"] = time.time()
+
             state["last_movement"] = datetime.now().strftime(
                 "%H:%M:%S"
+            )
+
+            latest_movement = max(
+                state["last_movement_timestamp"]
+                for state in camera_states
+            )
+
+
+            inactivity_time = (
+                time.time() - last_movement_time
             )
 
         if keypoints is not None:
@@ -897,45 +959,76 @@ while True:
 
             avg_conf = np.mean(keypoints[:, 2])
 
-            if avg_conf > 0.2 and stable_posture != "UNKNOWN":
+            person_present = (
+                avg_conf > 0.30 and
+                stable_posture != "UNKNOWN"
+            )
+
+            if person_present:
+
+                state["person_detected"] = True
+                state["last_person_seen"] = time.time()
 
                 state["last_visible"] = datetime.now().strftime("%H:%M:%S")
                 state["last_visible_timestamp"] = time.time()
 
+            if (
+                time.time() - state["last_person_seen"]
+            ) > 5:
+
+                state["person_detected"] = False
+
             # =====================================
-            # NOSE TRACKING
+            # HIP TRACKING
             # =====================================
 
-            rapid_drop = False  # ALWAYS define first
+            rapid_drop = False
 
-            nose_y = keypoints[0][0]
+            hip_y = (
+                keypoints[11][0] +
+                keypoints[12][0]
+            ) / 2
+
+            state["hip_history"].append(hip_y)
+
+            smooth_hip_y = np.mean(
+                state["hip_history"]
+            )
 
             if stable_posture == "UNKNOWN":
 
-                state["prev_nose_y"] = nose_y
+                state["prev_hip_y"] = smooth_hip_y
                 state["fall_buffer"].append(0)
 
             else:
 
-                if state["prev_nose_y"] is not None:
+                if state["prev_hip_y"] is not None:
 
-                    delta_y = nose_y - state["prev_nose_y"]
+                    vertical_drop = (
+                        smooth_hip_y -
+                        state["prev_hip_y"]
+                    )
 
-                    vertical_drop = abs(delta_y)
+                    low_confidence = avg_conf < 0.35
 
-                    fast_drop = vertical_drop > 0.12
-                    low_confidence = avg_conf < 0.3
-
-                    if fast_drop and (low_confidence or vertical_drop > 0.25):
+                    if (
+                        vertical_drop > 0.035 and
+                        low_confidence
+                    ):
                         rapid_drop = True
 
-                state["prev_nose_y"] = nose_y
+                        print(
+                            f"[CAM {cam_index+1}] "
+                            f"drop={vertical_drop:.3f} "
+                            f"conf={avg_conf:.3f} "
+                            f"rapid={rapid_drop}"
+                        )
 
-                if rapid_drop:
-                    state["rapid_drop"] = True
+                state["prev_hip_y"] = smooth_hip_y
 
-                state["fall_buffer"].append(1 if rapid_drop else 0)
-
+                state["fall_buffer"].append(
+                    1 if rapid_drop else 0
+                )
             # =====================
             # STABILITY CHECK
             # =====================
@@ -943,7 +1036,7 @@ while True:
             fall_votes = sum(state["fall_buffer"])
 
             fall_confirmed = (
-                fall_votes >= 2 and
+                sum(state["fall_buffer"]) >= 1 and
                 cooldown >= 10
             )
             
@@ -955,9 +1048,7 @@ while True:
                 state["fall_detected"] = True
                 state["last_fall_time"] = time.time()
 
-                print(f"[CAM {cam_index+1}] FALL CONFIRMED")
-
-                trigger_fall_alert(cam_index, frame)
+                trigger_fall_alert(cam_index)
 
             # =====================
             # RESET LOGIC
@@ -1005,7 +1096,7 @@ while True:
 
         cv2.putText(
             frame,
-            f"LAST VISIBLE: {state['last_visible']}",
+            f"LAST MOVEMENT: {state['last_movement']}",
             (20,310),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -1016,12 +1107,37 @@ while True:
 
         frames.append(frame)
 
+    
+
+    for state in camera_states:
+
+        if (
+            time.time()
+            - state["last_person_seen"]
+        ) > 5:
+
+            state["person_detected"] = False
+
+
+
+    inactivity_time = (
+        time.time() - last_movement_time
+    )
+
+    WELLNESS_TIMEOUT = get_timeout()
+
+    any_person_present = any(
+        state["person_detected"]
+        for state in camera_states
+    )
+
     if (
-        not wellness_active
-        and
-        time.time() - last_wellness_check_time > get_timeout()
+        any_person_present
+        and inactivity_time > WELLNESS_TIMEOUT
+        and not wellness_active
     ):
         start_wellness_check()
+
 
     process_wellness_check()
 
